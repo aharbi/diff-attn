@@ -7,7 +7,12 @@ import triton.testing
 
 from pathlib import Path
 from typing import Callable
-from layers import *
+from layers import (
+    MultiheadAttn,
+    MultiheadFlashAttn,
+    MultiheadDiffAttn,
+    MultiheadFlashDiffAttn,
+)
 
 
 def set_deterministic(seed=0):
@@ -25,6 +30,10 @@ def set_deterministic(seed=0):
     torch.backends.cudnn.benchmark = False
 
 
+def random_tensor_generator(*shape, dtype: torch.dtype, device: str):
+    return torch.empty(*shape, dtype=dtype, device=device).normal_(mean=0.0, std=0.5)
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["seq_len"],
@@ -35,17 +44,24 @@ def set_deterministic(seed=0):
         line_vals=["A", "FA", "DA", "DFA"],
         line_names=["A", "FA", "DA", "DFA"],
         plot_name="runtime",
-        args={"embed_dim": 512, "num_heads": 16, "batch_size": 1},
+        args={"num_heads": 16, "head_dim": 64, "batch_size": 1},
     )
 )
 def benchmark_runtime(
-    seq_len: int, embed_dim: int, num_heads: int, batch_size: int, implementation: int
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    batch_size: int,
+    implementation: str,
+    dtype=torch.float16,
+    device="cuda",
 ):
-    q = torch.randn(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
-    k = torch.randn(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
-    v = torch.randn(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
 
     quantiles = [0.5, 0.1, 0.9]
+
+    random_tensor = lambda *shape: random_tensor_generator(
+        *shape, dtype=dtype, device=device
+    )
 
     if implementation == "A":
         fn = MultiheadAttn
@@ -58,8 +74,22 @@ def benchmark_runtime(
     else:
         raise ValueError("Invalid implementation")
 
+    if fn in [MultiheadDiffAttn, MultiheadFlashDiffAttn]:
+        q1 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        q2 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        k1 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        k2 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        v = random_tensor(batch_size, num_heads, seq_len, head_dim)
+    else:
+        q = random_tensor(batch_size, num_heads, seq_len, head_dim)
+        k = random_tensor(batch_size, num_heads, seq_len, head_dim)
+        v = random_tensor(batch_size, num_heads, seq_len, head_dim)
+
     def run():
-        fn(q, k, v, embed_dim, num_heads)
+        if fn in [MultiheadDiffAttn, MultiheadFlashDiffAttn]:
+            fn(q1, q2, k1, k2, v)
+        else:
+            fn(q, k, v)
 
     ms, min_ms, max_ms = triton.testing.do_bench(lambda: run(), quantiles=quantiles)
 
@@ -76,15 +106,22 @@ def benchmark_runtime(
         line_vals=["A", "FA", "DA", "DFA"],
         line_names=["A", "FA", "DA", "DFA"],
         plot_name="memory",
-        args={"embed_dim": 512, "num_heads": 16, "batch_size": 1},
+        args={"num_heads": 16, "head_dim": 64, "batch_size": 1},
     )
 )
 def benchmark_memory_usage(
-    seq_len: int, embed_dim: int, num_heads: int, batch_size: int, implementation: str
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    batch_size: int,
+    implementation: str,
+    dtype=torch.float16,
+    device="cuda",
 ):
-    q = torch.randn(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
-    k = torch.randn(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
-    v = torch.randn(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
+
+    random_tensor = lambda *shape: random_tensor_generator(
+        *shape, dtype=dtype, device=device
+    )
 
     if implementation == "A":
         fn = MultiheadAttn
@@ -97,8 +134,24 @@ def benchmark_memory_usage(
     else:
         raise ValueError("Invalid implementation")
 
+    if fn in [MultiheadDiffAttn, MultiheadFlashDiffAttn]:
+        q1 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        q2 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        k1 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        k2 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+        v = random_tensor(batch_size, num_heads, seq_len, head_dim)
+    else:
+        q = random_tensor(batch_size, num_heads, seq_len, head_dim)
+        k = random_tensor(batch_size, num_heads, seq_len, head_dim)
+        v = random_tensor(batch_size, num_heads, seq_len, head_dim)
+
     torch.cuda.reset_peak_memory_stats()
-    fn(q, k, v, embed_dim, num_heads)
+
+    if fn in [MultiheadDiffAttn, MultiheadFlashDiffAttn]:
+        fn(q1, q2, k1, k2, v)
+    else:
+        fn(q, k, v)
+
     max_memory = torch.cuda.max_memory_allocated() / (1024**2)
 
     return max_memory
@@ -107,26 +160,42 @@ def benchmark_memory_usage(
 def benchmark_difference(
     fn1: Callable = MultiheadDiffAttn,
     fn2: Callable = MultiheadFlashDiffAttn,
-    seq_len: int = 16,
-    embed_dim: int = 512,
+    seq_len: int = 32,
+    head_dim: int = 128,
     num_heads: int = 16,
     batch_size: int = 1,
     N: int = 100,
+    dtype: torch.dtype = torch.float16,
+    device: str = "cuda",
     save_path: Path = "./results/difference/",
     benchmark_name: str = "difference",
 ):
 
-    set_deterministic(0)
+    random_tensor = lambda *shape: random_tensor_generator(
+        *shape, dtype=dtype, device=device
+    )
 
     diff = np.zeros(N)
 
     for i in range(N):
-        q = torch.rand(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
-        k = torch.rand(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
-        v = torch.rand(batch_size, seq_len, embed_dim, dtype=torch.float16, device="cuda")
+        if (fn1 and fn2) in [MultiheadDiffAttn, MultiheadFlashDiffAttn]:
+            q1 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+            q2 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+            k1 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+            k2 = random_tensor(batch_size, num_heads, seq_len, head_dim // 2)
+            v = random_tensor(batch_size, num_heads, seq_len, head_dim)
 
-        y1 = fn1(q, k, v, embed_dim, num_heads)
-        y2 = fn2(q, k, v, embed_dim, num_heads)
+            y1 = fn1(q1, q2, k1, k2, v)
+            y2 = fn2(q1, q2, k1, k2, v)
+        else:
+            q = random_tensor(batch_size, num_heads, seq_len, head_dim)
+            k = random_tensor(batch_size, num_heads, seq_len, head_dim)
+            v = random_tensor(batch_size, num_heads, seq_len, head_dim)
+
+            y1 = fn1(q, k, v)
+            y2 = fn2(q, k, v)
+
+        assert torch.allclose(y1, y2, atol=1e-2, rtol=0)
 
         diff[i] = torch.abs(y1 - y2).mean().item()
 
