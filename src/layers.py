@@ -28,7 +28,8 @@ def MultiheadAttn(q, k, v, embed_dim, num_heads, causal=True):
             1,
         )
 
-    attn_weights += attn_mask
+        attn_weights += attn_mask
+
     attn_weights = F.softmax(attn_weights, dim=-1)
 
     attn = torch.matmul(attn_weights, v)
@@ -60,7 +61,8 @@ def MultiheadDiffAttn(q, k, v, embed_dim, num_heads, lambda_full=0.5, causal=Tru
             1,
         )
 
-    attn_weights += attn_mask
+        attn_weights += attn_mask
+
     attn_weights = F.softmax(attn_weights, dim=-1)
 
     attn_weights = attn_weights.view(B, num_heads, 2, N, N)
