@@ -37,7 +37,7 @@ def MultiheadAttn(q, k, v, embed_dim, num_heads, causal=True):
     return attn
 
 
-def MultiheadDiffAttn(q, k, v, embed_dim, num_heads, lambda_full, causal=True):
+def MultiheadDiffAttn(q, k, v, embed_dim, num_heads, lambda_full=0.5, causal=True):
     head_dim = embed_dim // num_heads // 2
 
     B, N, _ = q.size()
@@ -88,7 +88,7 @@ def MultiheadFlashAttn(q, k, v, embed_dim, num_heads, causal=True):
     return attn
 
 
-def MultiheadFlashDiffAttn(q, k, v, embed_dim, num_heads, lambda_full, causal=True):
+def MultiheadFlashDiffAttn(q, k, v, embed_dim, num_heads, lambda_full=0.5, causal=True):
     head_dim = embed_dim // num_heads // 2
 
     B, N, _ = q.size()
