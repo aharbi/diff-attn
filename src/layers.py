@@ -1,109 +1,112 @@
-# Parts of this code are adapted from: https://github.com/microsoft/unilm/tree/master/Diff-Transformer
+# Parts of this code are adapted from:
+#   - https://github.com/microsoft/unilm/tree/master/Diff-Transformer
+#   - https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py
+
+import math
 import torch
 import torch.nn.functional as F
 
 from flash_attn import flash_attn_func
 
 
-def MultiheadAttn(q, k, v, embed_dim, num_heads, causal=True):
-    head_dim = embed_dim // num_heads
+def MultiheadAttn(
+    q: torch.tensor, k: torch.tensor, v: torch.tensor, causal: bool = True
+):
 
-    B, N, _ = q.size()
+    _, _, N, head_dim = q.size()
 
-    q = q.view(B, N, num_heads, head_dim)
-    k = k.view(B, N, num_heads, head_dim)
-    v = v.view(B, N, num_heads, head_dim)
+    sm_scale = 1 / math.sqrt(head_dim)
 
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-
-    q *= head_dim**-0.5
-
-    attn_weights = torch.matmul(q, k.transpose(-1, -2))
+    M = torch.tril(torch.ones((N, N), device="cuda"))
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
 
     if causal:
-        attn_mask = torch.triu(
-            torch.zeros([N, N]).float().fill_(float("-inf")).type_as(attn_weights),
-            1,
-        )
+        p[:, :, M == 0] = float("-inf")
 
-        attn_weights += attn_mask
+    p = torch.softmax(p.float(), dim=-1).half()
 
-    attn_weights = F.softmax(attn_weights, dim=-1)
-
-    attn = torch.matmul(attn_weights, v)
-    attn = attn.transpose(1, 2).reshape(B, N, num_heads * head_dim)
+    attn = torch.matmul(p, v)
 
     return attn
 
 
-def MultiheadDiffAttn(q, k, v, embed_dim, num_heads, lambda_full=0.5, causal=True):
-    head_dim = embed_dim // num_heads // 2
+def MultiheadDiffAttn(
+    q1: torch.tensor,
+    q2: torch.tensor,
+    k1: torch.tensor,
+    k2: torch.tensor,
+    v: torch.tensor,
+    lambda_scale: float = 0.5,
+    causal: bool = True,
+):
 
-    B, N, _ = q.size()
+    _, _, N, head_dim = q1.size()
 
-    q = q.view(B, N, 2 * num_heads, head_dim)
-    k = k.view(B, N, 2 * num_heads, head_dim)
-    v = v.view(B, N, num_heads, 2 * head_dim)
+    sm_scale = 1 / math.sqrt(head_dim)
 
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    M = torch.tril(torch.ones((N, N), device="cuda"))
 
-    q *= head_dim**-0.5
-
-    attn_weights = torch.matmul(q, k.transpose(-1, -2))
+    # First softmax
+    p1 = torch.matmul(q1, k1.transpose(2, 3)) * sm_scale
 
     if causal:
-        attn_mask = torch.triu(
-            torch.zeros([N, N]).float().fill_(float("-inf")).type_as(attn_weights),
-            1,
-        )
+        p1[:, :, M == 0] = float("-inf")
 
-        attn_weights += attn_mask
+    p1 = torch.softmax(p1.float(), dim=-1).half()
 
-    attn_weights = F.softmax(attn_weights, dim=-1)
+    # Second softmax
+    p2 = torch.matmul(q2, k2.transpose(2, 3)) * sm_scale
 
-    attn_weights = attn_weights.view(B, num_heads, 2, N, N)
-    attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+    if causal:
+        p2[:, :, M == 0] = float("-inf")
 
-    attn = torch.matmul(attn_weights, v)
-    attn = attn.transpose(1, 2).reshape(B, N, num_heads * 2 * head_dim)
+    p2 = torch.softmax(p2.float(), dim=-1).half()
+
+    p = p1 - lambda_scale * p2
+
+    attn = torch.matmul(p, v)
 
     return attn
 
 
-def MultiheadFlashAttn(q, k, v, embed_dim, num_heads, causal=True):
-    head_dim = embed_dim // num_heads
+def MultiheadFlashAttn(
+    q: torch.tensor, k: torch.tensor, v: torch.tensor, causal: bool = True
+):
 
-    B, N, _ = q.size()
-
-    q = q.view(B, N, num_heads, head_dim)
-    k = k.view(B, N, num_heads, head_dim)
-    v = v.view(B, N, num_heads, head_dim)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
 
     attn = flash_attn_func(q, k, v, causal=causal)
 
-    attn = attn.reshape(B, N, num_heads * head_dim)
+    attn = attn.transpose(1, 2)
 
     return attn
 
 
-def MultiheadFlashDiffAttn(q, k, v, embed_dim, num_heads, lambda_full=0.5, causal=True):
-    head_dim = embed_dim // num_heads // 2
+def MultiheadFlashDiffAttn(
+    q1: torch.tensor,
+    q2: torch.tensor,
+    k1: torch.tensor,
+    k2: torch.tensor,
+    v: torch.tensor,
+    lambda_scale: float = 0.5,
+    causal: bool = True,
+):
+    B, num_heads, N, head_dim = q1.size()
 
-    B, N, _ = q.size()
+    v = v.view(B, num_heads, N, 2, head_dim)
 
-    q = q.view(B, N, 2 * num_heads, head_dim)
-    k = k.view(B, N, 2 * num_heads, head_dim)
-    v = v.view(B, N, num_heads, 2, head_dim)
-
-    q = q.reshape(B, N, num_heads, 2, head_dim)
-    k = k.reshape(B, N, num_heads, 2, head_dim)
-    q1, q2 = q[:, :, :, 0], q[:, :, :, 1]
-    k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
     v1, v2 = v[:, :, :, 0], v[:, :, :, 1]
+
+    q1 = q1.transpose(1, 2)
+    q2 = q2.transpose(1, 2)
+
+    k1 = k1.transpose(1, 2)
+    k2 = k2.transpose(1, 2)
+
+    v1 = v1.transpose(1, 2)
+    v2 = v2.transpose(1, 2)
 
     attn11 = flash_attn_func(q1, k1, v1, causal=causal)
     attn12 = flash_attn_func(q1, k1, v2, causal=causal)
@@ -113,7 +116,8 @@ def MultiheadFlashDiffAttn(q, k, v, embed_dim, num_heads, lambda_full=0.5, causa
     attn22 = flash_attn_func(q2, k2, v2, causal=causal)
     attn2 = torch.cat([attn21, attn22], dim=-1)
 
-    attn = attn1 - lambda_full * attn2
-    attn = attn.reshape(B, N, num_heads * 2 * head_dim)
+    attn = attn1 - lambda_scale * attn2
+
+    attn = attn.transpose(1, 2)
 
     return attn
