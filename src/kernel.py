@@ -5,6 +5,7 @@ Credits:
 * Triton's implementation: https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py
 * Flash attention papers (https://arxiv.org/abs/2205.14135,
                           https://tridao.me/publications/flash2/flash2.pdf)
+* Differential Transformer paper (https://arxiv.org/pdf/2410.05258?)
 * Rabe and Staats (https://arxiv.org/pdf/2112.05682v2.pdf)
 """
 
