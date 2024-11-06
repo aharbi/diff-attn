@@ -115,28 +115,23 @@ def _attn_fwd(
     M1,
     M2,
     Out,  #
-
     # Strides
     stride_qz,
     stride_qh,
     stride_qm,
     stride_qk,  #
-
     stride_kz,
     stride_kh,
     stride_kn,
     stride_kk,  #
-
     stride_vz,
     stride_vh,
     stride_vk,
     stride_vn,  #
-
     stride_oz,
     stride_oh,
     stride_om,
     stride_on,  #
-
     # Shapes
     Z,
     H,
@@ -144,7 +139,6 @@ def _attn_fwd(
     HEAD_DIM_Q: tl.constexpr,  #
     HEAD_DIM_K: tl.constexpr,  #
     HEAD_DIM_V: tl.constexpr,  #
-
     # Constants
     BLOCK_M: tl.constexpr,  #
     BLOCK_N: tl.constexpr,  #
@@ -160,6 +154,7 @@ def _attn_fwd(
 
     # Get the offest of the specific batch element and head number combination
     qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
 
     # Q Block pointers
     Q1_block_ptr = tl.make_block_ptr(
@@ -202,7 +197,7 @@ def _attn_fwd(
     # V Block pointers
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
     V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
+        base=V + v_offset,
         shape=(N_CTX, HEAD_DIM_V),
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
@@ -212,7 +207,7 @@ def _attn_fwd(
 
     # O Block pointers
     O_block_ptr = tl.make_block_ptr(
-        base=Out + qvk_offset,
+        base=Out + v_offset,
         shape=(N_CTX, HEAD_DIM_V),
         strides=(stride_om, stride_on),
         offsets=(start_m * BLOCK_M, 0),
@@ -229,10 +224,14 @@ def _attn_fwd(
     # NOTE: Initialized in SRAM
     # initialize pointer to m and l
     m_i_1 = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max for each row
-    l_i_1 = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0           # Normalization factor for each row
+    l_i_1 = (
+        tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    )  # Normalization factor for each row
 
     m_i_2 = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # Max for each row
-    l_i_2 = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0           # Normalization factor for each row
+    l_i_2 = (
+        tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    )  # Normalization factor for each row
 
     acc_1 = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
     acc_2 = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
@@ -249,7 +248,6 @@ def _attn_fwd(
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        tl.static_print("Hello!")
         acc_1, l_i_1, m_i_1 = _attn_fwd_inner(
             acc_1,
             l_i_1,
@@ -289,7 +287,6 @@ def _attn_fwd(
         )
     # stage 2: on-band
     if STAGE & 2:
-        tl.static_print("I was called too!")
         # barrier makes it easier for compielr to schedule the
         # two loops independently
         acc_1, l_i_1, m_i_1 = _attn_fwd_inner(
@@ -345,12 +342,12 @@ def _attn_fwd(
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
 
-class _attention(torch.autograd.Function):
+class _diff_attention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q1, q2, k1, k2, v, causal, sm_scale):
-        BLOCK_M = 32
-        BLOCK_N = 32
+        BLOCK_M = 16
+        BLOCK_N = 16
 
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q1.shape[-1], k1.shape[-1]
@@ -359,7 +356,7 @@ class _attention(torch.autograd.Function):
         HEAD_DIM_V = v.shape[-1]
 
         # NOTE: For DA, we probably need to remove the second assertion
-        assert HEAD_DIM_Q == HEAD_DIM_K # and HEAD_DIM_K == HEAD_DIM_V
+        assert HEAD_DIM_Q == HEAD_DIM_K  # and HEAD_DIM_K == HEAD_DIM_V
 
         # NOTE: This is fine
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
@@ -383,11 +380,15 @@ class _attention(torch.autograd.Function):
 
         # NOTE: Maximum value
         M_1 = torch.empty(
-            (q1.shape[0], q1.shape[1], q1.shape[2]), device=q1.device, dtype=torch.float32
+            (q1.shape[0], q1.shape[1], q1.shape[2]),
+            device=q1.device,
+            dtype=torch.float32,
         )
 
         M_2 = torch.empty(
-            (q1.shape[0], q1.shape[1], q1.shape[2]), device=q1.device, dtype=torch.float32
+            (q1.shape[0], q1.shape[1], q1.shape[2]),
+            device=q1.device,
+            dtype=torch.float32,
         )
 
         _attn_fwd[grid](
@@ -435,19 +436,20 @@ if __name__ == "__main__":
     # Quick test
     import math
 
-    from layers import MultiheadDiffAttn
+    from layers import MultiheadDiffAttn, MultiheadDiffAttnKernel
 
-    q1 = torch.rand(1, 1, 1024, 32 // 2, dtype=torch.float16).to("cuda")
-    q2 = torch.rand(1, 1, 1024, 32 // 2, dtype=torch.float16).to("cuda")
-    k1 = torch.rand(1, 1, 1024, 32 // 2, dtype=torch.float16).to("cuda")
-    k2 = torch.rand(1, 1, 1024, 32 // 2, dtype=torch.float16).to("cuda")
-    v = torch.rand(1, 1, 1024, 32, dtype=torch.float16).to("cuda")
+    B = 64
+    H = 8
 
-    _, _, N, head_dim = q1.size()
+    q1 = torch.rand(B, H, 1024, 32 // 2, dtype=torch.float16).to("cuda")
+    q2 = torch.zeros(B, H, 1024, 32 // 2, dtype=torch.float16).to("cuda")
+    k1 = torch.rand(B, H, 1024, 32 // 2, dtype=torch.float16).to("cuda")
+    k2 = torch.zeros(B, H, 1024, 32 // 2, dtype=torch.float16).to("cuda")
+    v = torch.rand(B, H, 1024, 32, dtype=torch.float16).to("cuda")
 
-    sm_scale = 1 / math.sqrt(head_dim)
-
-    y1 = _attention.apply(q1, q2, k1, k2, v, False, sm_scale)
+    y1 = MultiheadDiffAttnKernel(q1, q2, k1, k2, v, causal=False, lambda_scale=1)
     y2 = MultiheadDiffAttn(q1, q2, k1, k2, v, causal=False, lambda_scale=1)
+
+    print(y1 - y2)
 
     print(torch.allclose(y1, y2, atol=1e-2))
