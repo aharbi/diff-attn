@@ -20,11 +20,16 @@ def is_hip():
 
 @triton.jit
 def _attn_fwd_inner(
-    acc,
-    l_i,
-    m_i,
-    q,  #
-    K_block_ptr,
+    acc_1,
+    acc_2,
+    l_i_1,
+    l_i_2,
+    m_i_1,
+    m_i_2,
+    q_1,  #
+    q_2,
+    K1_block_ptr,
+    K2_block_ptr,
     V_block_ptr,  #
     start_m,
     qk_scale,  #
@@ -46,41 +51,82 @@ def _attn_fwd_inner(
     # causal = False
     else:
         lo, hi = 0, N_CTX
-    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+
+    K1_block_ptr = tl.advance(K1_block_ptr, (0, lo))
+    K2_block_ptr = tl.advance(K2_block_ptr, (0, lo))
+
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
-        k = tl.load(K_block_ptr)
-        qk = tl.dot(q, k)
+        k_1 = tl.load(K1_block_ptr)
+        k_2 = tl.load(K2_block_ptr)
+
+        qk_1 = tl.dot(q_1, k_1)
+        qk_2 = tl.dot(q_2, k_2)
+
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
+
+            qk_1 = qk_1 * qk_scale + tl.where(mask, 0, -1.0e6)
+            qk_2 = qk_2 * qk_scale + tl.where(mask, 0, -1.0e6)
+
+            m_ij_1 = tl.maximum(m_i_1, tl.max(qk_1, 1))
+            m_ij_2 = tl.maximum(m_i_2, tl.max(qk_2, 1))
+
+            qk_1 -= m_ij_1[:, None]
+            qk_2 -= m_ij_2[:, None]
+
         else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
-        p = tl.math.exp2(qk)
-        l_ij = tl.sum(p, 1)
+            m_ij_1 = tl.maximum(m_i_1, tl.max(qk_1, 1) * qk_scale)
+            m_ij_2 = tl.maximum(m_i_2, tl.max(qk_2, 1) * qk_scale)
+
+            qk_1 = qk_1 * qk_scale - m_ij_1[:, None]
+            qk_2 = qk_2 * qk_scale - m_ij_2[:, None]
+
+        p_1 = tl.math.exp2(qk_1)
+        p_2 = tl.math.exp2(qk_2)
+
+        l_ij_1 = tl.sum(p_1, 1)
+        l_ij_2 = tl.sum(p_2, 1)
+
         # -- update m_i and l_i
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_i = l_i * alpha + l_ij
+        alpha_1 = tl.math.exp2(m_i_1 - m_ij_1)
+        alpha_2 = tl.math.exp2(m_i_2 - m_ij_2)
+
+        l_i_1 = l_i_1 * alpha_1 + l_ij_1
+        l_i_2 = l_i_2 * alpha_2 + l_ij_2
+
         # -- update output accumulator --
-        acc = acc * alpha[:, None]
+        acc_1 = acc_1 * alpha_1[:, None]
+        acc_2 = acc_2 * alpha_2[:, None]
+
         # update acc
         v = tl.load(V_block_ptr)
+
         if fp8_v:
-            p = p.to(tl.float8e5)
+            p_1 = p_1.to(tl.float8e5)
+            p_2 = p_2.to(tl.float8e5)
+
         else:
-            p = p.to(tl.float16)
-        acc = tl.dot(p, v, acc)
+            p_1 = p_1.to(tl.float16)
+            p_2 = p_2.to(tl.float16)
+
+        acc_1 = tl.dot(p_1, v, acc_1)
+        acc_2 = tl.dot(p_2, v, acc_2)
+
         # update m_i and l_i
-        m_i = m_ij
+        m_i_1 = m_ij_1
+        m_i_2 = m_ij_2
+
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-    return acc, l_i, m_i
+
+        K1_block_ptr = tl.advance(K1_block_ptr, (0, BLOCK_N))
+        K2_block_ptr = tl.advance(K2_block_ptr, (0, BLOCK_N))
+
+    return acc_1, acc_2, l_i_1, l_i_2, m_i_1, m_i_2
 
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
@@ -248,30 +294,16 @@ def _attn_fwd(
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        acc_1, l_i_1, m_i_1 = _attn_fwd_inner(
+        acc_1, acc_2, l_i_1, l_i_2, m_i_1, m_i_2 = _attn_fwd_inner(
             acc_1,
-            l_i_1,
-            m_i_1,
-            q1,
-            K1_block_ptr,
-            V_block_ptr,  #
-            start_m,
-            qk_scale,  #
-            BLOCK_M,
-            HEAD_DIM_V,
-            BLOCK_N,  #
-            4 - STAGE,
-            offs_m,
-            offs_n,
-            N_CTX,
-            V.dtype.element_ty == tl.float8e5,  #
-        )
-
-        acc_2, l_i_2, m_i_2 = _attn_fwd_inner(
             acc_2,
+            l_i_1,
             l_i_2,
+            m_i_1,
             m_i_2,
+            q1,
             q2,
+            K1_block_ptr,
             K2_block_ptr,
             V_block_ptr,  #
             start_m,
@@ -285,34 +317,21 @@ def _attn_fwd(
             N_CTX,
             V.dtype.element_ty == tl.float8e5,  #
         )
+
     # stage 2: on-band
     if STAGE & 2:
         # barrier makes it easier for compielr to schedule the
         # two loops independently
-        acc_1, l_i_1, m_i_1 = _attn_fwd_inner(
+        acc_1, acc_2, l_i_1, l_i_2, m_i_1, m_i_2 = _attn_fwd_inner(
             acc_1,
-            l_i_1,
-            m_i_1,
-            q1,
-            K1_block_ptr,
-            V_block_ptr,  #
-            start_m,
-            qk_scale,  #
-            BLOCK_M,
-            HEAD_DIM_V,
-            BLOCK_N,  #
-            2,
-            offs_m,
-            offs_n,
-            N_CTX,
-            V.dtype.element_ty == tl.float8e5,  #
-        )
-
-        acc_2, l_i_2, m_i_2 = _attn_fwd_inner(
             acc_2,
+            l_i_1,
             l_i_2,
+            m_i_1,
             m_i_2,
+            q1,
             q2,
+            K1_block_ptr,
             K2_block_ptr,
             V_block_ptr,  #
             start_m,
@@ -346,8 +365,8 @@ class _diff_attention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q1, q2, k1, k2, v, causal, sm_scale):
-        BLOCK_M = 16
-        BLOCK_N = 16
+        BLOCK_M = 64
+        BLOCK_N = 32
 
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q1.shape[-1], k1.shape[-1]
@@ -438,7 +457,7 @@ if __name__ == "__main__":
 
     from layers import MultiheadDiffAttn, MultiheadDiffAttnKernel
 
-    B = 64
+    B = 8
     H = 8
 
     q1 = torch.rand(B, H, 1024, 32 // 2, dtype=torch.float16).to("cuda")
